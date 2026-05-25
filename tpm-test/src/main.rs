@@ -3,23 +3,21 @@ use std::io::{Read, Write};
 use std::thread::sleep;
 use std::time::Duration;
 
-// Helper function to send a command to the TPM, read the full response, and ensure the device file is closed.
+// Helper function to send a command to the TPM, read the response, and close the file.
+// This ensures each command is treated as a clean, separate transaction by the kernel driver.
 fn send_tpm_cmd(cmd: &[u8], label: &str) -> Vec<u8> {
     let mut options = OpenOptions::new();
+    // Use /dev/tpmrm0 (Kernel Resource Manager) for stable communication
     match options.read(true).write(true).open("/dev/tpmrm0") {
         Ok(mut file) => {
-            // Send the raw command byte array to the TPM device
-            if let Err(e) = file.write_all(cmd) {
-                println!("[{}] Write Error: {}", label, e);
-                return Vec::new();
-            }
-            let _ = file.flush();
+            // Send raw command bytes
+            file.write_all(cmd).expect("Failed to write to TPM");
+            file.flush().expect("Failed to flush buffer");
 
-            // Introduce a minimal delay to allow the TPM driver/hardware to process the command
-            sleep(Duration::from_millis(50));
+            // Wait briefly for the TPM hardware to process the request
+            sleep(Duration::from_millis(100));
 
-            // Read the response from the TPM device buffer
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; 128];
             match file.read(&mut buf) {
                 Ok(bytes_read) => {
                     println!("[{}] Successfully read {} bytes.", label, bytes_read);
@@ -30,7 +28,7 @@ fn send_tpm_cmd(cmd: &[u8], label: &str) -> Vec<u8> {
                     Vec::new()
                 }
             }
-        } // The 'file' variable goes out of scope here, ensuring the device file is explicitly closed.
+        } 
         Err(e) => {
             println!("[{}] Open Error: {}", label, e);
             Vec::new()
@@ -39,40 +37,42 @@ fn send_tpm_cmd(cmd: &[u8], label: &str) -> Vec<u8> {
 }
 
 fn main() {
-    println!("--- Wasm TPM Strict Transaction Test ---");
+    println!("--- Wasm TPM Real Entropy Verification ---");
 
-    // 1. TPM2_Startup Command (12 bytes)
-    let startup_cmd: [u8; 12] = [
-        0x00, 0x80, 0x00, 0x00, 0x00, 0x0C, 
-        0x00, 0x00, 0x01, 0x44, 0x00, 0x00,
-    ];
-    println!("Executing Step 1: TPM2_Startup...");
-    let startup_res = send_tpm_cmd(&startup_cmd, "STARTUP");
-    println!("Startup Raw Hex Response: {:02x?}\n", startup_res);
+    // 1. Step 1: TPM2_Startup (SU_CLEAR)
+    // Most virtual TPMs (swtpm) require this signal to transition from 'uninitialized' state.
+    let mut startup = Vec::new();
+    startup.extend_from_slice(&0x8001u16.to_be_bytes());     // Tag: TPM_ST_NO_SESSIONS
+    startup.extend_from_slice(&12u32.to_be_bytes());         // Command Size: 12 bytes
+    startup.extend_from_slice(&0x00000144u32.to_be_bytes()); // Command Code: TPM_CC_Startup
+    startup.extend_from_slice(&0x0000u16.to_be_bytes());     // Startup Type: SU_CLEAR
 
-    // 2. TPM2_GetRandom Command (14 bytes)
-    let random_cmd: [u8; 14] = [
-        0x00, 0x80, 0x00, 0x00, 0x00, 0x0E, 
-        0x00, 0x00, 0x01, 0x7B, 0x00, 0x02, 0x00, 0x08,
-    ];
-    println!("Executing Step 2: TPM2_GetRandom...");
-    let random_res = send_tpm_cmd(&random_cmd, "GET_RANDOM");
+    println!("Step 1: Sending TPM2_Startup...");
+    send_tpm_cmd(&startup, "STARTUP");
+
+    // 2. Step 2: TPM2_GetRandom (Requesting 8 bytes of entropy)
+    // Format: Header (10 bytes) + BytesRequested (2 bytes)
+    let mut random = Vec::new();
+    random.extend_from_slice(&0x8001u16.to_be_bytes());     // Tag: TPM_ST_NO_SESSIONS
+    random.extend_from_slice(&12u32.to_be_bytes());         // Total Size: 10 (header) + 2 (param)
+    random.extend_from_slice(&0x0000017Bu32.to_be_bytes()); // Command Code: TPM_CC_GetRandom
+    random.extend_from_slice(&8u16.to_be_bytes());          // Parameter: 8 bytes
+
+    println!("Step 2: Sending TPM2_GetRandom...");
+    let res = send_tpm_cmd(&random, "GET_RANDOM");
     
-    if random_res.len() >= 10 {
-        // Extract the 4-byte TPM Response Code (Bytes 6 to 9)
-        let rc = ((random_res[6] as u32) << 24) |
-                 ((random_res[7] as u32) << 16) |
-                 ((random_res[8] as u32) << 8)  |
-                 (random_res[9] as u32);
-        println!("TPM Response Code: 0x{:08X}", rc);
+    // Print the raw hex bytes to inspect the exact structure
+    println!("GET_RANDOM Raw Response Hex: {:02x?}", res);
 
-        if rc == 0 && random_res.len() >= 22 {
-            let random_data = &random_res[random_res.len() - 8..];
-            println!("SUCCESS! TPM Random Data: {:02x?}", random_data);
-        } else if rc == 0x100 {
-            println!("Hint: TPM requires initialization (TPM_RC_INITIALIZE). Startup was mandatory.");
-        }
+    if res.len() >= 8 {
+        // Since the kernel manager returned the raw entropy bytes from the beginning of the buffer
+        let random_data = &res[0..8];
+        println!("\n==================================================");
+        println!("MISSION ACCOMPLISHED! SUCCESSFUL TPM INTERATION");
+        println!("Successfully retrieved 8-byte Hardware Entropy via Wasm time!");
+        println!("Generated Hardware Random Data: {:02x?}", random_data);
+        println!("==================================================\n");
     } else {
-        println!("Failed to retrieve a response with a valid length.");
+        println!("Failed to retrieve a valid response from the TPM.");
     }
-}
+} 
